@@ -212,9 +212,9 @@ def _api(method: str, **params) -> dict:
     return resp.json()
 
 
-def _send(chat_id: int, text: str) -> None:
+def _send(chat_id: int, text: str, **kwargs) -> None:
     try:
-        _api("sendMessage", chat_id=chat_id, text=text)
+        _api("sendMessage", chat_id=chat_id, text=text, **kwargs)
     except Exception:
         logger.exception("sendMessage 실패 (chat_id=%d)", chat_id)
 
@@ -228,7 +228,7 @@ def run_bot() -> None:
 
     while True:
         try:
-            params: dict = {"timeout": 30, "allowed_updates": ["message"]}
+            params: dict = {"timeout": 30, "allowed_updates": ["message", "callback_query"]}
             if offset is not None:
                 params["offset"] = offset
 
@@ -254,7 +254,65 @@ def run_bot() -> None:
             retry_delay = min(retry_delay * 2, 60)
 
 
+def send_menu(chat_id: int) -> None:
+    text = "제어 방식을 선택하세요 (WOL 부팅):"
+    reply_markup = {
+        "inline_keyboard": [
+            [{"text": "🚀 매직 패킷 전송 (WOL)", "callback_data": "send_wol"}],
+            [{"text": "📋 상태 확인", "callback_data": "check_status"},
+             {"text": "📄 최근 로그 보기", "callback_data": "show_log"}]
+        ]
+    }
+    _send(chat_id, text, reply_markup=reply_markup)
+
+
 def _handle_update(update: dict) -> None:
+    if "callback_query" in update:
+        cq = update["callback_query"]
+        chat_id = cq["message"]["chat"]["id"]
+        uid = cq["from"]["id"]
+        data = cq.get("data", "")
+
+        logger.debug("콜백 수신 — user_id=%d, data=%r", uid, data)
+
+        if uid != ALLOWED_USER_ID:
+            logger.warning("허가되지 않은 접근 차단 (콜백) — user_id=%d", uid)
+            try:
+                _api("answerCallbackQuery", callback_query_id=cq["id"])
+            except Exception:
+                pass
+            return
+
+        try:
+            if data == "send_wol":
+                logger.info("콜백: send_wol — user_id=%d", uid)
+                try:
+                    send_wol_packet(TARGET_MAC_ADDRESS)
+                    _api("answerCallbackQuery", callback_query_id=cq["id"], text="WOL 패킷 전송 완료")
+                    _send(chat_id, f"✅ WOL 패킷을 전송했습니다.\nMAC: {TARGET_MAC_ADDRESS}")
+                except Exception as exc:
+                    logger.exception("WOL 패킷 전송 실패")
+                    _api("answerCallbackQuery", callback_query_id=cq["id"], text="전송 실패")
+                    _send(chat_id, f"❌ 전송 실패: {exc}")
+
+            elif data == "check_status":
+                logger.info("콜백: check_status — user_id=%d", uid)
+                _api("answerCallbackQuery", callback_query_id=cq["id"])
+                _send(chat_id,
+                      f"ℹ️ 봇 정상 동작 중\n"
+                      f"대상 MAC: {TARGET_MAC_ADDRESS}\n"
+                      f"로그 파일: {LOG_FILE}")
+
+            elif data == "show_log":
+                logger.info("콜백: show_log — user_id=%d", uid)
+                _api("answerCallbackQuery", callback_query_id=cq["id"])
+                log_text = _tail_log(30)
+                _send(chat_id, f"📄 최근 로그 30줄:\n\n{log_text}")
+        except Exception:
+            logger.exception("콜백 처리 중 오류")
+
+        return
+
     message = update.get("message")
     if not message:
         return
@@ -267,30 +325,20 @@ def _handle_update(update: dict) -> None:
 
     if uid != ALLOWED_USER_ID:
         logger.warning("허가되지 않은 접근 차단 — user_id=%d", uid)
-        _send(chat_id, "접근 권한이 없습니다.")
         return
 
-    if text.startswith("/start"):
-        logger.info("/start 수신 — user_id=%d", uid)
-        _send(chat_id,
-              "WOL 봇이 준비되었습니다.\n"
-              "/wol    — WOL 패킷 전송\n"
-              "/status — 봇 상태 확인\n"
-              "/log    — 최근 로그 30줄\n"
-              "/log N  — 최근 로그 N줄 (최대 100)")
-
-    elif text.startswith("/wol"):
+    if text.startswith("/wol"):
         logger.info("/wol 수신 — user_id=%d", uid)
         try:
             send_wol_packet(TARGET_MAC_ADDRESS)
-            _send(chat_id, f"WOL 패킷을 전송했습니다.\nMAC: {TARGET_MAC_ADDRESS}")
+            _send(chat_id, f"✅ WOL 패킷을 전송했습니다.\nMAC: {TARGET_MAC_ADDRESS}")
         except Exception as exc:
             logger.exception("WOL 패킷 전송 실패")
-            _send(chat_id, f"전송 실패: {exc}")
+            _send(chat_id, f"❌ 전송 실패: {exc}")
 
     elif text.startswith("/status"):
         _send(chat_id,
-              f"봇 정상 동작 중\n"
+              f"ℹ️ 봇 정상 동작 중\n"
               f"대상 MAC: {TARGET_MAC_ADDRESS}\n"
               f"로그 파일: {LOG_FILE}")
 
@@ -298,19 +346,16 @@ def _handle_update(update: dict) -> None:
         parts = text.split()
         try:
             lines = max(1, min(int(parts[1]), 100)) if len(parts) > 1 else 30
+            log_text = _tail_log(lines)
+            _send(chat_id, f"📄 최근 로그 {lines}줄:\n\n{log_text}")
         except ValueError:
             _send(chat_id, "사용법: /log [줄수]  (예: /log 50, 최대 100)")
-            return
-
-        log_text = _tail_log(lines)
-        _send(chat_id, f"📄 최근 로그 {lines}줄:\n\n{log_text}")
 
     else:
-        _send(chat_id,
-              "/wol    — WOL 패킷 전송\n"
-              "/status — 봇 상태 확인\n"
-              "/log    — 최근 로그 30줄\n"
-              "/log N  — 최근 로그 N줄 (최대 100)")
+        # /start 이거나 그 외 일반 텍스트일 때는 인라인 키보드 메뉴 제공
+        if text.startswith("/start"):
+            logger.info("/start 수신 — user_id=%d", uid)
+        send_menu(chat_id)
 
 
 # ── systemd 서비스 등록/제거 ───────────────────
@@ -399,6 +444,24 @@ def uninstall_service(remove_logs: bool = True) -> None:
     print(f"\n서비스 '{SERVICE_NAME}' 제거 완료.")
 
 
+def restart_service() -> None:
+    if os.geteuid() != 0:
+        logger.error("서비스 재시작은 root 권한이 필요합니다. sudo 로 실행하세요.")
+        sys.exit(1)
+
+    result = subprocess.run(
+        ["systemctl", "restart", SERVICE_NAME], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        logger.error("재시작 실패: %s", result.stderr.strip())
+        sys.exit(1)
+
+    status = subprocess.run(
+        ["systemctl", "is-active", SERVICE_NAME], capture_output=True, text=True
+    )
+    print(f"서비스 재시작 완료 — 상태: {status.stdout.strip()}")
+
+
 def show_status() -> None:
     result = subprocess.run(
         ["systemctl", "status", SERVICE_NAME], capture_output=True, text=True
@@ -416,6 +479,7 @@ HELP_TEXT = textwrap.dedent(f"""\
     Commands:
       config             설정값 입력 및 저장 (.env)
       install            systemd 서비스로 등록하고 시작합니다  (sudo 필요)
+      restart            서비스를 재시작합니다  (sudo 필요)
       uninstall          서비스를 중지·삭제하고 로그를 제거합니다  (sudo 필요)
       status             서비스 동작 상태를 확인합니다
       run                봇을 포그라운드에서 직접 실행합니다
@@ -452,8 +516,9 @@ def main() -> None:
 
     sub.add_parser("config",  help="설정값 입력 및 저장 (.env)")
     sub.add_parser("run",     help="봇 직접 실행 (서비스에서 호출)")
-    sub.add_parser("install", help="systemd 서비스로 등록 (sudo 필요)")
-    sub.add_parser("status",  help="서비스 상태 확인")
+    sub.add_parser("install",  help="systemd 서비스로 등록 (sudo 필요)")
+    sub.add_parser("restart",  help="서비스 재시작 (sudo 필요)")
+    sub.add_parser("status",   help="서비스 상태 확인")
 
     p_uninstall = sub.add_parser("uninstall", help="서비스 + 로그 삭제 (sudo 필요)")
     p_uninstall.add_argument(
@@ -470,6 +535,8 @@ def main() -> None:
         load_config()
         validate_config()
         install_service()
+    elif args.command == "restart":
+        restart_service()
     elif args.command == "uninstall":
         uninstall_service(remove_logs=not args.keep_logs)
     elif args.command == "status":
