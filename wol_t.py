@@ -260,7 +260,20 @@ def send_menu(chat_id: int) -> None:
         "inline_keyboard": [
             [{"text": "🚀 매직 패킷 전송 (WOL)", "callback_data": "send_wol"}],
             [{"text": "📋 상태 확인", "callback_data": "check_status"},
-             {"text": "📄 최근 로그 보기", "callback_data": "show_log"}]
+             {"text": "📄 로그 보기", "callback_data": "show_log"}]
+        ]
+    }
+    _send(chat_id, text, reply_markup=reply_markup)
+
+
+def send_log_menu(chat_id: int) -> None:
+    text = "출력할 로그 줄수를 선택하세요:"
+    reply_markup = {
+        "inline_keyboard": [
+            [{"text": "30줄", "callback_data": "show_log:30"},
+             {"text": "50줄", "callback_data": "show_log:50"},
+             {"text": "100줄", "callback_data": "show_log:100"}],
+            [{"text": "◀ 뒤로", "callback_data": "back_to_menu"}]
         ]
     }
     _send(chat_id, text, reply_markup=reply_markup)
@@ -294,6 +307,7 @@ def _handle_update(update: dict) -> None:
                     logger.exception("WOL 패킷 전송 실패")
                     _api("answerCallbackQuery", callback_query_id=cq["id"], text="전송 실패")
                     _send(chat_id, f"❌ 전송 실패: {exc}")
+                send_menu(chat_id)
 
             elif data == "check_status":
                 logger.info("콜백: check_status — user_id=%d", uid)
@@ -302,12 +316,25 @@ def _handle_update(update: dict) -> None:
                       f"ℹ️ 봇 정상 동작 중\n"
                       f"대상 MAC: {TARGET_MAC_ADDRESS}\n"
                       f"로그 파일: {LOG_FILE}")
+                send_menu(chat_id)
 
             elif data == "show_log":
                 logger.info("콜백: show_log — user_id=%d", uid)
                 _api("answerCallbackQuery", callback_query_id=cq["id"])
-                log_text = _tail_log(30)
-                _send(chat_id, f"📄 최근 로그 30줄:\n\n{log_text}")
+                send_log_menu(chat_id)
+
+            elif data.startswith("show_log:"):
+                n = max(1, min(int(data.split(":")[1]), 100))
+                logger.info("콜백: show_log:%d — user_id=%d", n, uid)
+                _api("answerCallbackQuery", callback_query_id=cq["id"])
+                log_text = _tail_log(n)
+                _send(chat_id, f"📄 최근 로그 {n}줄:\n\n{log_text}")
+                send_menu(chat_id)
+
+            elif data == "back_to_menu":
+                _api("answerCallbackQuery", callback_query_id=cq["id"])
+                send_menu(chat_id)
+
         except Exception:
             logger.exception("콜백 처리 중 오류")
 
@@ -335,12 +362,14 @@ def _handle_update(update: dict) -> None:
         except Exception as exc:
             logger.exception("WOL 패킷 전송 실패")
             _send(chat_id, f"❌ 전송 실패: {exc}")
+        send_menu(chat_id)
 
     elif text.startswith("/status"):
         _send(chat_id,
               f"ℹ️ 봇 정상 동작 중\n"
               f"대상 MAC: {TARGET_MAC_ADDRESS}\n"
               f"로그 파일: {LOG_FILE}")
+        send_menu(chat_id)
 
     elif text.startswith("/log"):
         parts = text.split()
@@ -350,6 +379,7 @@ def _handle_update(update: dict) -> None:
             _send(chat_id, f"📄 최근 로그 {lines}줄:\n\n{log_text}")
         except ValueError:
             _send(chat_id, "사용법: /log [줄수]  (예: /log 50, 최대 100)")
+        send_menu(chat_id)
 
     else:
         # /start 이거나 그 외 일반 텍스트일 때는 인라인 키보드 메뉴 제공
@@ -462,6 +492,11 @@ def restart_service() -> None:
     print(f"서비스 재시작 완료 — 상태: {status.stdout.strip()}")
 
 
+def show_log_cli(n: int) -> None:
+    n = max(1, min(n, 100))
+    print(_tail_log(n))
+
+
 def show_status() -> None:
     result = subprocess.run(
         ["systemctl", "status", SERVICE_NAME], capture_output=True, text=True
@@ -482,6 +517,7 @@ HELP_TEXT = textwrap.dedent(f"""\
       restart            서비스를 재시작합니다  (sudo 필요)
       uninstall          서비스를 중지·삭제하고 로그를 제거합니다  (sudo 필요)
       status             서비스 동작 상태를 확인합니다
+      log [N]            로그 파일 마지막 N줄 출력 (기본 30, 최대 100)
       run                봇을 포그라운드에서 직접 실행합니다
 
     Bot Commands (텔레그램):
@@ -520,6 +556,10 @@ def main() -> None:
     sub.add_parser("restart",  help="서비스 재시작 (sudo 필요)")
     sub.add_parser("status",   help="서비스 상태 확인")
 
+    p_log = sub.add_parser("log", help="로그 파일 출력 (기본 30줄, 최대 100)")
+    p_log.add_argument("n", nargs="?", type=int, default=30,
+                       help="출력할 줄수 (기본값: 30, 최대: 100)")
+
     p_uninstall = sub.add_parser("uninstall", help="서비스 + 로그 삭제 (sudo 필요)")
     p_uninstall.add_argument(
         "--keep-logs",
@@ -541,6 +581,8 @@ def main() -> None:
         uninstall_service(remove_logs=not args.keep_logs)
     elif args.command == "status":
         show_status()
+    elif args.command == "log":
+        show_log_cli(args.n)
     elif args.command == "run":
         load_config()
         validate_config()
